@@ -13,7 +13,9 @@ Four AI agents run in sequence on a real permit application:
 
 The system only ever auto-approves when every applicable check passes. Anything that fails, is missing data, or falls under a category that always requires judgment (e.g. a historic overlay district) routes to a human reviewer by design.
 
-It's a static site — no backend, no build step, no database. It calls Groq's free API (Llama 3.3 70B) directly from the browser — a plain `fetch` to Groq's OpenAI-compatible endpoint, with your own API key held only in memory for that page load. If no key is entered, or a call fails, it falls back to an equivalent local "Demo Mode" so the page is never broken — a small badge always shows which mode each step actually ran in.
+It's a static site — no backend, no build step, no database. It calls Groq's free API (GPT-OSS 120B) directly from the browser — a plain `fetch` to Groq's OpenAI-compatible endpoint, with your own API key held only in memory for that page load. If no key is entered, or a call fails, it falls back to an equivalent local "Demo Mode" so the page is never broken — a small badge always shows which mode each step actually ran in.
+
+**Model note:** the app uses `openai/gpt-oss-120b`, which is on Groq's free tier. A couple of Groq's other models (e.g. `llama-3.3-70b-versatile`) are gated to Enterprise-tier accounts and will 404 with a plain free key — if you ever swap the model in `app.js`, check [console.groq.com/docs/models](https://console.groq.com/docs/models) first to confirm it's free-tier accessible.
 
 ## Files
 

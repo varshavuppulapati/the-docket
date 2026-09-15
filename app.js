@@ -202,7 +202,7 @@
   }
 
   // ---------------- live Groq API (free tier, OpenAI-compatible) ----------------
-  var GROQ_MODEL = "llama-3.3-70b-versatile";
+  var GROQ_MODEL = "openai/gpt-oss-120b";
   async function callLLM(system, user, maxTokens){
     var res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
       method: "POST",
