@@ -1,7 +1,8 @@
 (function(){
   "use strict";
 
-  var STATE = { apiKey:null, currentExampleId:null, usedLive:false, usedDemo:false, warned:false, lastError:null };
+  var STATE = { apiKey:null, currentExampleId:null, usedLive:false, usedDemo:false, warned:false, lastError:null,
+    memQueue:null, memCounter:0 };
 
   var CURATED = {
     maple: { applicant:"Homeowner", address:"123 Maple Street", zone:"R-1", project_type:"Room addition",
@@ -201,7 +202,54 @@
     return today + "\n\n" + lines.join("\n");
   }
 
-  // ---------------- live Groq API (free tier, OpenAI-compatible) ----------------
+  // ---------------- missing-info detection (structured "ask", not a chat message) ----------------
+  function findMissingInfo(structured){
+    var dims = structured.dimensions || {};
+    var missing = [];
+    if(structured.address == null) missing.push({ key:"address", label:"Property address", type:"text" });
+    if(structured.zone == null) missing.push({ key:"zone", label:"Zoning district (e.g. R-1)", type:"text" });
+    if(dims.lot_area_sqft == null) missing.push({ key:"dimensions.lot_area_sqft", label:"Total lot area (sq ft)", type:"number" });
+    if(dims.existing_coverage_sqft == null) missing.push({ key:"dimensions.existing_coverage_sqft", label:"Existing building coverage (sq ft)", type:"number" });
+    if(dims.addition_area_sqft == null && /addition|garage|porch|construction/i.test(structured.project_type||"")) {
+      missing.push({ key:"dimensions.addition_area_sqft", label:"New construction footprint (sq ft)", type:"number" });
+    }
+    return missing;
+  }
+
+  function setByPath(obj, path, val){
+    var parts = path.split(".");
+    var cur = obj;
+    for(var i=0;i<parts.length-1;i++){ cur = cur[parts[i]] = cur[parts[i]] || {}; }
+    cur[parts[parts.length-1]] = val;
+  }
+
+  function promptForMissingInfo(missing, structured){
+    return new Promise(function(resolve){
+      var fieldsHtml = missing.map(function(m){
+        return '<div class="field-row"><label>'+escapeHtml(m.label)+'</label><input data-key="'+m.key+'" type="'+(m.type==="number"?"number":"text")+'" /></div>';
+      }).join("");
+      var card = el('<div class="doc-card clarify-card"><h3>A Few Things We Need <span class="stamp-tag">Waiting on you</span></h3>' +
+        '<p class="clarify-note">The Intake Agent read the application but couldn\'t find every figure the Compliance Agent needs. Rather than guess, the pipeline is pausing here — fill in what\'s missing and review picks up exactly where it left off.</p>' +
+        '<div class="clarify-fields">'+fieldsHtml+'</div>' +
+        '<div class="clarify-actions"><button class="run-btn" id="clarifyContinue" type="button">Continue Review →</button></div></div>');
+      document.getElementById("desk").appendChild(card);
+      showCard(card);
+      setStepState(0, "waiting");
+      card.querySelector("#clarifyContinue").addEventListener("click", function(){
+        missing.forEach(function(m){
+          var input = card.querySelector('[data-key="'+m.key+'"]');
+          var raw = input ? input.value.trim() : "";
+          if(!raw) return;
+          setByPath(structured, m.key, m.type==="number" ? parseFloat(raw) : raw);
+        });
+        card.querySelector(".clarify-actions").innerHTML = '<span class="clarify-done">✓ Information received — continuing…</span>';
+        setStepState(0, "done");
+        resolve(structured);
+      });
+    });
+  }
+
+  // ---------------- live Groq API (free tier, OpenAI-compatible, reasoning model) ----------------
   var GROQ_MODEL = "openai/gpt-oss-120b";
   async function callLLM(system, user, maxTokens){
     var res = await fetch("https://api.groq.com/openai/v1/chat/completions", {
@@ -212,7 +260,8 @@
       },
       body: JSON.stringify({
         model: GROQ_MODEL,
-        max_completion_tokens: maxTokens || 1024,
+        max_completion_tokens: (maxTokens || 1024) + 400, // headroom: gpt-oss is a reasoning model, needs budget beyond the final answer
+        reasoning_effort: "low", // keep chain-of-thought short so the budget goes to the actual answer
         messages: [
           { role:"system", content: system },
           { role:"user", content: user }
@@ -225,7 +274,8 @@
       throw new Error("API " + res.status + ": " + errText);
     }
     var data = await res.json();
-    return (data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content) || "";
+    var msg = (data.choices && data.choices[0] && data.choices[0].message) || {};
+    return { content: msg.content || "", reasoning: msg.reasoning || "" };
   }
 
   function extractJson(text){
@@ -242,7 +292,7 @@
       ') — continuing in Demo Mode for the remaining steps. If you\'re opening this file directly (file://), serve it over http(s) instead (GitHub Pages works) for live calls to succeed.</div>';
   }
 
-  // ---------------- the four agents ----------------
+  // ---------------- the five agents ----------------
   async function runAgent1(rawText){
     var hints = getCompromiseHints(rawText);
     if(STATE.apiKey){
@@ -250,16 +300,16 @@
         var sys = 'You are a municipal permit intake clerk AI. Extract structured facts from a raw permit application into STRICT JSON only (no prose, no markdown fences), matching exactly this shape: {"applicant":string|null,"address":string|null,"zone":string|null,"project_type":string|null,"dimensions":{"front_setback_ft":number|null,"side_setback_ft":number|null,"rear_setback_ft":number|null,"secondary_front_setback_ft":number|null,"accessory_setback_ft":number|null,"height_ft":number|null,"lot_area_sqft":number|null,"existing_coverage_sqft":number|null,"addition_area_sqft":number|null},"notes":string|null}. Use null for anything not clearly stated. Do not guess values.';
         var user = "Pre-extracted hints from a classical NLP pass — numbers found: [" + hints.numbers.join(", ") +
           "]; proper nouns found: [" + hints.nouns.join(", ") + "].\n\nRaw application:\n\"\"\"\n" + rawText + "\n\"\"\"";
-        var text = await callLLM(sys, user, 700);
-        var json = extractJson(text);
+        var res = await callLLM(sys, user, 700);
+        var json = extractJson(res.content);
         STATE.usedLive = true;
-        return { data: json, source:"live", raw: text };
+        return { data: json, source:"live", raw: res.content, reasoning: res.reasoning };
       }catch(e){ STATE.lastError = e.message; warnFallback(e); }
     }
     STATE.usedDemo = true;
     var curated = CURATED[STATE.currentExampleId];
     var data = curated ? JSON.parse(JSON.stringify(curated)) : genericExtract(rawText);
-    return { data: data, source:"demo", raw: JSON.stringify(data, null, 2) };
+    return { data: data, source:"demo", raw: JSON.stringify(data, null, 2), reasoning: "" };
   }
 
   async function runAgent2(structured, rawText){
@@ -270,15 +320,15 @@
         var sys = 'You are a municipal code research AI. You are given structured facts about a permit application and a shortlist of candidate zoning code clauses found by search. Decide which clauses genuinely govern this specific case. Respond in STRICT JSON only: {"applicable":[{"id":string,"why":string}],"excluded_note":string}. "why" must be one short sentence. Do not include a clause just because it appeared in the candidate list — only include ones that truly apply.';
         var user = "Structured facts:\n" + JSON.stringify(structured, null, 2) +
           "\n\nCandidate clauses:\n" + candidates.map(function(c){ return c.id + " — " + c.text; }).join("\n");
-        var text = await callLLM(sys, user, 700);
-        var json = extractJson(text);
+        var res = await callLLM(sys, user, 700);
+        var json = extractJson(res.content);
         STATE.usedLive = true;
-        return { data: json, source:"live", raw: text, candidates: candidates };
+        return { data: json, source:"live", raw: res.content, reasoning: res.reasoning, candidates: candidates };
       }catch(e){ STATE.lastError = e.message; warnFallback(e); }
     }
     STATE.usedDemo = true;
     var applicable = fallbackApplicable(structured, rawText, candidates);
-    return { data: { applicable: applicable }, source:"demo", raw: JSON.stringify(applicable, null, 2), candidates: candidates };
+    return { data: { applicable: applicable }, source:"demo", raw: JSON.stringify(applicable, null, 2), reasoning: "", candidates: candidates };
   }
 
   async function runAgent3(structured, applicable){
@@ -290,14 +340,14 @@
         var user = "Case facts:\n" + JSON.stringify(structured, null, 2) +
           "\n\nComputed results:\n" + JSON.stringify(rows, null, 2) +
           "\n\nDetermination already decided by the system: " + determination;
-        var text = await callLLM(sys, user, 500);
-        var json = extractJson(text);
+        var res = await callLLM(sys, user, 500);
+        var json = extractJson(res.content);
         STATE.usedLive = true;
-        return { rows: rows, determination: determination, narrative: json.narrative, source:"live", raw: text };
+        return { rows: rows, determination: determination, narrative: json.narrative, source:"live", raw: res.content, reasoning: res.reasoning };
       }catch(e){ STATE.lastError = e.message; warnFallback(e); }
     }
     STATE.usedDemo = true;
-    return { rows: rows, determination: determination, narrative: fallbackNarrative(rows), source:"demo", raw: "Demo Mode: narrative generated locally from the computed rows." };
+    return { rows: rows, determination: determination, narrative: fallbackNarrative(rows), source:"demo", raw: "Demo Mode: narrative generated locally from the computed rows.", reasoning: "" };
   }
 
   async function runAgent4(structured, rows, determination, narrative){
@@ -307,13 +357,189 @@
         var user = "Applicant/case facts:\n" + JSON.stringify(structured, null, 2) +
           "\n\nFindings:\n" + JSON.stringify(rows, null, 2) +
           "\n\nNarrative summary: " + narrative + "\n\nFinal determination: " + determination;
-        var text = await callLLM(sys, user, 650);
+        var res = await callLLM(sys, user, 650);
         STATE.usedLive = true;
-        return { letter: text.trim(), source:"live" };
+        return { letter: res.content.trim(), source:"live", reasoning: res.reasoning };
       }catch(e){ STATE.lastError = e.message; warnFallback(e); }
     }
     STATE.usedDemo = true;
-    return { letter: fallbackLetter(structured, rows, determination), source:"demo" };
+    return { letter: fallbackLetter(structured, rows, determination), source:"demo", reasoning: "" };
+  }
+
+  // ---------------- Agent 5: Execution — a real multi-step automated workflow, not one filing action ----------------
+  var QUEUE_KEY = "docket_case_queue_v1";
+  var COUNTER_KEY = "docket_case_counter_v1";
+  var FEE_SCHEDULE = { base: 150, perSqFt: 0.35, garageFlat: 75 };
+
+  function loadQueue(){
+    try{ return JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]"); }
+    catch(e){ return STATE.memQueue || (STATE.memQueue = []); }
+  }
+  function saveQueueRecord(record){
+    try{
+      var q = JSON.parse(localStorage.getItem(QUEUE_KEY) || "[]");
+      q.unshift(record);
+      localStorage.setItem(QUEUE_KEY, JSON.stringify(q));
+      return q;
+    }catch(e){
+      STATE.memQueue = STATE.memQueue || [];
+      STATE.memQueue.unshift(record);
+      return STATE.memQueue;
+    }
+  }
+  function clearQueue(){
+    try{ localStorage.removeItem(QUEUE_KEY); }catch(e){}
+    STATE.memQueue = [];
+  }
+  function nextCaseId(){
+    var year = new Date().getFullYear();
+    var n;
+    try{
+      n = parseInt(localStorage.getItem(COUNTER_KEY) || "0", 10) + 1;
+      localStorage.setItem(COUNTER_KEY, String(n));
+    }catch(e){
+      STATE.memCounter = (STATE.memCounter || 0) + 1;
+      n = STATE.memCounter;
+    }
+    return "SDL-" + year + "-" + String(1000 + n);
+  }
+
+  // business-day math + .ics generation, so "scheduling" produces a file any real calendar app can import
+  function businessDaysFromNow(n){
+    var d = new Date();
+    var added = 0;
+    while(added < n){
+      d.setDate(d.getDate()+1);
+      var day = d.getDay();
+      if(day!==0 && day!==6) added++;
+    }
+    return d;
+  }
+  function formatICSDate(d){ return d.toISOString().replace(/[-:]/g,"").split(".")[0]+"Z"; }
+  function buildICS(opts){
+    var start = opts.start;
+    var end = new Date(start.getTime() + (opts.durationMinutes||60)*60000);
+    var uid = "docket-" + Date.now() + "-" + Math.floor(Math.random()*1e6) + "@spatialdatalogic.local";
+    return [
+      "BEGIN:VCALENDAR","VERSION:2.0","PRODID:-//The Docket//Execution Agent//EN","BEGIN:VEVENT",
+      "UID:"+uid,
+      "DTSTAMP:"+formatICSDate(new Date()),
+      "DTSTART:"+formatICSDate(start),
+      "DTEND:"+formatICSDate(end),
+      "SUMMARY:"+opts.title,
+      "DESCRIPTION:"+(opts.description||"").replace(/\n/g,"\\n"),
+      "END:VEVENT","END:VCALENDAR"
+    ].join("\r\n");
+  }
+
+  function computeFee(structured){
+    var dims = structured.dimensions || {};
+    var area = dims.addition_area_sqft || 0;
+    var fee = FEE_SCHEDULE.base + area*FEE_SCHEDULE.perSqFt;
+    if(/garage/i.test(structured.project_type||"")) fee += FEE_SCHEDULE.garageFlat;
+    return Math.round(fee*100)/100;
+  }
+  function computeSLA(rows){
+    var anyFail = rows.some(function(r){ return r.status==="fail"; });
+    var days = anyFail ? 5 : 8;
+    var priority = anyFail ? "High" : "Medium";
+    return { days: days, priority: priority, dueDate: businessDaysFromNow(days) };
+  }
+
+  function buildPermitRecord(record, fee){
+    var isGarage = /garage/i.test(record.structured.project_type||"");
+    return "PERMIT RECORD (estimated, generated automatically)\n" +
+      "Case: " + record.id + "\n" +
+      "Address: " + (record.structured.address || "—") + "\n" +
+      "Project: " + (record.structured.project_type || "—") + "\n" +
+      "Status: Eligible for Administrative Approval\n" +
+      "Estimated fee: $" + fee.toFixed(2) + " (base $" + FEE_SCHEDULE.base.toFixed(2) + " + $" + FEE_SCHEDULE.perSqFt.toFixed(2) + "/sq ft of new construction" +
+        (isGarage ? " + $" + FEE_SCHEDULE.garageFlat.toFixed(2) + " garage inspection surcharge" : "") + ")\n\n" +
+      "This record was generated automatically by The Docket's Execution Agent upon administrative approval. It is a prototype estimate, not an official fee schedule.\n";
+  }
+
+  function buildRoutingPacket(record, routing, sla){
+    return "INTERNAL ROUTING NOTE (generated automatically, not sent)\n" +
+      "Case: " + record.id + "\n" +
+      "Address: " + (record.structured.address || "—") + "\n" +
+      "Project: " + (record.structured.project_type || "—") + "\n" +
+      "Route to: " + routing + "\n" +
+      "Priority: " + sla.priority + "\n" +
+      "Response due by: " + sla.dueDate.toLocaleDateString() + " (" + sla.days + " business days)\n" +
+      "Reason: automated review could not issue an administrative approval on its own — see the attached determination letter for the specific finding(s) that require judgment or fail a numeric threshold.\n\n" +
+      "This packet and the accompanying calendar reminder were generated by The Docket's Execution Agent. No external message has been sent on your behalf — forward it internally as your process requires.\n";
+  }
+
+  function downloadFile(filename, text, mime){
+    var blob = new Blob([text], {type: mime || "text/plain"});
+    var url = URL.createObjectURL(blob);
+    var a = document.createElement("a");
+    a.href = url; a.download = filename;
+    document.body.appendChild(a); a.click(); document.body.removeChild(a);
+    setTimeout(function(){ URL.revokeObjectURL(url); }, 4000);
+  }
+
+  // Runs the actual post-determination workflow: assigns a case number, then branches into either
+  // "issue and schedule" or "escalate and schedule review", producing real files at each automated step.
+  async function runAgent5(structured, rows, determination, letter){
+    var caseId = nextCaseId();
+    var approved = determination === "Eligible for Administrative Approval";
+    var steps = [];
+    var record = {
+      id: caseId, address: structured.address, project: structured.project_type,
+      determination: determination, timestamp: Date.now(), letter: letter, structured: structured, rows: rows
+    };
+
+    steps.push({ label:"Case number assigned", detail: caseId });
+
+    if(approved){
+      var fee = computeFee(structured);
+      steps.push({ label:"Permit fee calculated", detail:"$"+fee.toFixed(2)+" (estimated)" });
+
+      var certText = buildPermitRecord(record, fee);
+      steps.push({ label:"Permit record generated", detail: caseId+"-permit-record.txt",
+        dl:{ filename: caseId+"-permit-record.txt", content: certText, mime:"text/plain" } });
+
+      var inspDate = businessDaysFromNow(10);
+      var icsInsp = buildICS({ title:"Final Building Inspection — "+(structured.address||caseId),
+        description:"Automatically scheduled by The Docket upon administrative approval. Case "+caseId+".",
+        start: inspDate, durationMinutes:60 });
+      steps.push({ label:"Final inspection scheduled", detail: inspDate.toLocaleDateString()+" (10 business days out)",
+        dl:{ filename: caseId+"-inspection.ics", content: icsInsp, mime:"text/calendar" } });
+
+      record.status = "Permit Issued — Inspection Scheduled";
+      record.fee = fee;
+      record.inspectionDateISO = inspDate.toISOString();
+      record.permitRecordText = certText;
+      record.inspectionIcs = icsInsp;
+    } else {
+      var routing = rows.some(function(r){ return r.id === "ZN-108"; }) ? "Design Review Board" : "Licensed Plan Reviewer Queue";
+      var sla = computeSLA(rows);
+      steps.push({ label:"Routed to "+routing, detail: sla.priority+" priority" });
+
+      var packet = buildRoutingPacket(record, routing, sla);
+      steps.push({ label:"Routing packet generated", detail: caseId+"-routing-packet.txt",
+        dl:{ filename: caseId+"-routing-packet.txt", content: packet, mime:"text/plain" } });
+
+      var icsReview = buildICS({ title:"Review due: "+caseId+" ("+routing+")",
+        description:"Automatically scheduled by The Docket. Priority: "+sla.priority+".",
+        start: sla.dueDate, durationMinutes:30 });
+      steps.push({ label:"Reviewer deadline scheduled", detail:"Due "+sla.dueDate.toLocaleDateString()+" ("+sla.days+" business days)",
+        dl:{ filename: caseId+"-review-deadline.ics", content: icsReview, mime:"text/calendar" } });
+
+      record.status = "Escalated — Routed to " + routing;
+      record.routing = routing;
+      record.priority = sla.priority;
+      record.dueDateISO = sla.dueDate.toISOString();
+      record.routingPacketText = packet;
+      record.reviewIcs = icsReview;
+    }
+
+    steps.push({ label:"Filed to Case Queue", detail: record.status });
+
+    saveQueueRecord(record);
+    refreshSidebarStats();
+    return { caseId: caseId, steps: steps, record: record, source: "local" };
   }
 
   // ---------------- rendering ----------------
@@ -330,27 +556,32 @@
     var t = card.querySelector(".trace-toggle"), p = card.querySelector(".trace");
     if(t && p) t.addEventListener("click", function(){ p.classList.toggle("show"); });
   }
-  function traceBlock(raw){ return '<span class="trace-toggle">View raw agent output</span><pre class="trace">' + escapeHtml(raw) + "</pre>"; }
+  function traceBlock(raw, reasoning){
+    var reasoningHtml = reasoning ? '<div class="think-label">Agent reasoning (live, from the model)</div><div class="think">'+escapeHtml(reasoning)+'</div>' : "";
+    return '<span class="trace-toggle">View agent detail</span><div class="trace">'+reasoningHtml+
+      '<div class="think-label">Raw output</div><pre class="raw-out">'+escapeHtml(raw)+'</pre></div>';
+  }
   function badge(n, source){ return "Agent " + n + " · " + (source === "live" ? "Live" : "Demo"); }
 
   function buildRail(){
-    var steps = ["Intake","Code Research","Compliance","Determination"];
-    var subs = ["Extract structured facts","Retrieve & apply code","Check every dimension","Draft the letter"];
+    var steps = ["Intake","Code Research","Compliance","Determination","Execution"];
+    var subs = ["Extract structured facts","Retrieve & apply code","Check every dimension","Draft the letter","Run the automated workflow"];
     document.getElementById("rail").innerHTML = steps.map(function(s,i){
-      return '<div class="rail-step" data-i="'+i+'"><div class="rail-dot">'+(i+1)+'</div><div class="rail-txt"><b>'+s+'</b><span>'+subs[i]+'</span></div></div>'
+      return '<div class="rail-step" data-i="'+i+'"><div class="rail-dot">'+(i+1)+'</div><div class="rail-txt"><b>'+s+'</b><span>'+subs[i]+'</span><span class="rail-live">contacting Groq…</span></div></div>'
         + (i < steps.length-1 ? '<div class="rail-line"></div>' : "");
     }).join("");
   }
   function setStepState(i, state){
     var stepEl = document.querySelector('.rail-step[data-i="'+i+'"]');
     if(!stepEl) return;
-    stepEl.classList.remove("active","done");
+    stepEl.classList.remove("active","done","waiting");
     var dot = stepEl.querySelector(".rail-dot");
     if(state === "active"){ stepEl.classList.add("active"); dot.textContent = String(i+1); }
     else if(state === "done"){ stepEl.classList.add("done"); dot.textContent = "✓"; }
+    else if(state === "waiting"){ stepEl.classList.add("waiting"); dot.textContent = "?"; }
   }
 
-  function renderCard1(structured, source, raw){
+  function renderCard1(structured, source, raw, reasoning){
     var dims = structured.dimensions || {};
     function kv(label, val, unit){ if(val==null || val==="") return ""; return '<div><div class="k">'+label+'</div><div class="v">'+val+(unit?(" "+unit):"")+"</div></div>"; }
     var kvHtml = kv("Applicant", structured.applicant) + kv("Address", structured.address) + kv("Zone", structured.zone) +
@@ -358,22 +589,22 @@
       kv("Rear setback", dims.rear_setback_ft, "ft") + kv("Secondary frontage", dims.secondary_front_setback_ft, "ft") +
       kv("Height", dims.height_ft, "ft") + kv("Lot area", dims.lot_area_sqft, "sq ft") + kv("Existing coverage", dims.existing_coverage_sqft, "sq ft") +
       kv("Addition area", dims.addition_area_sqft, "sq ft") + kv("Coverage", dims.coverage_pct, "%");
-    var card = el('<div class="doc-card"><h3>Intake Summary <span class="stamp-tag">'+badge(1,source)+'</span></h3><div class="kv-grid">'+kvHtml+"</div>"+traceBlock(raw)+"</div>");
+    var card = el('<div class="doc-card"><h3>Intake Summary <span class="stamp-tag">'+badge(1,source)+'</span></h3><div class="kv-grid">'+kvHtml+"</div>"+traceBlock(raw, reasoning)+"</div>");
     document.getElementById("desk").appendChild(card);
     showCard(card); wireTrace(card);
   }
 
-  function renderCard2(applicable, source, raw){
+  function renderCard2(applicable, source, raw, reasoning){
     var html = applicable.map(function(a){
       var clause = window.ZONING_CODE.filter(function(c){ return c.id===a.id; })[0];
       return '<div class="clause"><div class="id">'+a.id+" — "+(clause?clause.topic:"")+'</div><div class="why">'+escapeHtml(a.why||"")+"</div></div>";
     }).join("") || '<div class="clause"><div class="why">No specific clauses were determined to apply.</div></div>';
-    var card = el('<div class="doc-card"><h3>Applicable Code Sections <span class="stamp-tag">'+badge(2,source)+'</span></h3>'+html+traceBlock(raw)+"</div>");
+    var card = el('<div class="doc-card"><h3>Applicable Code Sections <span class="stamp-tag">'+badge(2,source)+'</span></h3>'+html+traceBlock(raw, reasoning)+"</div>");
     document.getElementById("desk").appendChild(card);
     showCard(card); wireTrace(card);
   }
 
-  function renderCard3(rows, narrative, determination, source, raw){
+  function renderCard3(rows, narrative, determination, source, raw, reasoning){
     var rowsHtml = rows.map(function(r){
       if(r.status === "human") return '<div class="check-row"><span>'+r.topic+'</span><span class="val">Requires review<span class="glyph no">!</span></span></div>';
       if(r.status === "unknown") return '<div class="check-row"><span>'+r.topic+'</span><span class="val">No data<span class="glyph no">?</span></span></div>';
@@ -387,7 +618,7 @@
     var card = el('<div class="doc-card"><h3>Compliance Check <span class="stamp-tag">'+badge(3,source)+'</span></h3>'+rowsHtml+
       '<div class="narrative">'+escapeHtml(narrative)+'</div>'+
       '<div class="check-row" style="border-top:2px solid var(--line-strong);margin-top:6px;"><span><b>Determination</b></span><span class="val" style="font-weight:700;color:'+color+'">'+determination+'</span></div>'+
-      traceBlock(raw)+"</div>");
+      traceBlock(raw, reasoning)+"</div>");
     document.getElementById("desk").appendChild(card);
     showCard(card); wireTrace(card);
     var bars = card.querySelectorAll(".gauge-bar");
@@ -411,11 +642,11 @@
     }, delay);
   }
 
-  function renderCard4(letterText, determination, source){
+  function renderCard4(letterText, determination, source, reasoning){
     var dateStr = new Date().toLocaleDateString("en-US", {year:"numeric", month:"long", day:"numeric"});
     var card = el('<div class="letter"><div class="letterhead"><span>Office of Planning &amp; Permitting</span><span>'+dateStr+'</span></div>'+
       '<div class="body-text"></div><div class="seal"><div class="ring"></div><span></span></div>'+
-      '<div style="margin-top:10px;">'+traceBlock("Agent 4 (" + (source==="live"?"Live":"Demo") + ") — letter shown above is the raw output.")+'</div></div>');
+      '<div style="margin-top:10px;">'+traceBlock("Agent 4 (" + (source==="live"?"Live":"Demo") + ") — letter shown above is the raw output.", reasoning)+'</div></div>');
     document.getElementById("desk").appendChild(card);
     showCard(card); wireTrace(card);
     var bodyEl = card.querySelector(".body-text");
@@ -426,6 +657,41 @@
       sealEl.classList.add(approved ? "approve" : "review", "show");
       sealTxt.style.whiteSpace = "pre-line";
       sealTxt.textContent = approved ? "APPROVED" : "NEEDS\nREVIEW";
+    });
+  }
+
+  function renderCard5(exec, determination, letter){
+    var steps = exec.steps;
+    var stepsHtml = steps.map(function(s, i){
+      var dlBtn = s.dl ? '<button class="ghost-btn step-dl" data-idx="'+i+'">Download</button>' : "";
+      return '<div class="exec-step" style="animation-delay:'+(i*110)+'ms;">' +
+        '<div class="exec-step-main"><span class="glyph ok">✓</span><div class="exec-step-text"><b>'+escapeHtml(s.label)+'</b><span class="exec-step-detail">'+escapeHtml(s.detail)+'</span></div></div>' +
+        dlBtn +
+      "</div>";
+    }).join("");
+    var card = el('<div class="doc-card exec-card"><h3>Execution Workflow <span class="stamp-tag">Agent 5 · '+steps.length+' automated steps</span></h3>' +
+      '<p class="exec-intro">This isn\'t a filing message — it\'s a short workflow that actually ran: every line below produced a real, checkable result.</p>' +
+      '<div class="exec-steps">'+stepsHtml+'</div>' +
+      '<div class="exec-actions">' +
+        '<button class="ghost-btn" data-dl="letter">Download Determination Letter (.txt)</button>' +
+        '<button class="ghost-btn" data-dl="queue">View in Case Queue</button>' +
+      "</div></div>");
+    document.getElementById("desk").appendChild(card);
+    showCard(card); wireTrace(card);
+    card.querySelectorAll(".step-dl").forEach(function(btn){
+      btn.addEventListener("click", function(){
+        var idx = parseInt(btn.getAttribute("data-idx"), 10);
+        var s = steps[idx];
+        if(s && s.dl) downloadFile(s.dl.filename, s.dl.content, s.dl.mime);
+      });
+    });
+    card.querySelectorAll("[data-dl]").forEach(function(btn){
+      var kind = btn.getAttribute("data-dl");
+      if(!kind) return;
+      btn.addEventListener("click", function(){
+        if(kind === "letter") downloadFile(exec.caseId + "-determination-letter.txt", letter, "text/plain");
+        else if(kind === "queue") navigate("queue");
+      });
     });
   }
 
@@ -457,27 +723,141 @@
     var structured = r1.data;
     computeDerived(structured);
     setStepState(0, "done");
-    renderCard1(structured, r1.source, r1.raw);
+    renderCard1(structured, r1.source, r1.raw, r1.reasoning);
+
+    var missing = findMissingInfo(structured);
+    if(missing.length){
+      structured = await promptForMissingInfo(missing, structured);
+      computeDerived(structured);
+    }
 
     setStepState(1, "active");
     var r2 = await runAgent2(structured, rawText);
     setStepState(1, "done");
-    renderCard2(r2.data.applicable || [], r2.source, r2.raw);
+    renderCard2(r2.data.applicable || [], r2.source, r2.raw, r2.reasoning);
 
     setStepState(2, "active");
     var r3 = await runAgent3(structured, r2.data.applicable || []);
     setStepState(2, "done");
-    renderCard3(r3.rows, r3.narrative, r3.determination, r3.source, r3.raw);
+    renderCard3(r3.rows, r3.narrative, r3.determination, r3.source, r3.raw, r3.reasoning);
 
     setStepState(3, "active");
     var r4 = await runAgent4(structured, r3.rows, r3.determination, r3.narrative);
     setStepState(3, "done");
-    renderCard4(r4.letter, r3.determination, r4.source);
+    renderCard4(r4.letter, r3.determination, r4.source, r4.reasoning);
+
+    setStepState(4, "active");
+    var r5 = await runAgent5(structured, r3.rows, r3.determination, r4.letter);
+    setStepState(4, "done");
+    renderCard5(r5, r3.determination, r4.letter);
 
     var elapsed = ((performance.now() - t0) / 1000).toFixed(1);
     document.getElementById("statTime").textContent = elapsed + "s";
     document.getElementById("impact").style.display = "flex";
     updateChipAfterRun();
+  }
+
+  // ---------------- Case Queue view ----------------
+  function refreshSidebarStats(){
+    var q = loadQueue();
+    var approved = q.filter(function(r){ return r.determination === "Eligible for Administrative Approval"; }).length;
+    var totalEl = document.getElementById("miniTotal"), apEl = document.getElementById("miniApproved"), cntEl = document.getElementById("queueCount");
+    if(totalEl) totalEl.textContent = q.length;
+    if(apEl) apEl.textContent = approved;
+    if(cntEl) cntEl.textContent = q.length;
+  }
+
+  function renderQueueView(filter){
+    filter = filter || "all";
+    var q = loadQueue();
+    var filtered = q.filter(function(r){
+      if(filter === "approved") return r.determination === "Eligible for Administrative Approval";
+      if(filter === "review") return r.determination !== "Eligible for Administrative Approval";
+      return true;
+    });
+    var approvedCount = q.filter(function(r){ return r.determination === "Eligible for Administrative Approval"; }).length;
+    document.getElementById("queueStats").innerHTML =
+      '<div class="qstat"><b>'+q.length+'</b><span>Total Cases</span></div>' +
+      '<div class="qstat"><b>'+(q.length ? Math.round(approvedCount/q.length*100) : 0)+'%</b><span>Auto-Approved</span></div>' +
+      '<div class="qstat"><b>'+(q.length-approvedCount)+'</b><span>Escalated</span></div>';
+    var rowsHtml = filtered.map(function(r){
+      var approved = r.determination === "Eligible for Administrative Approval";
+      return '<div class="qrow" data-id="'+r.id+'">' +
+        '<div class="qcell qid">'+r.id+'</div>' +
+        '<div class="qcell qaddr">'+escapeHtml(r.address||"—")+'</div>' +
+        '<div class="qcell qproj">'+escapeHtml(r.project||"—")+'</div>' +
+        '<div class="qcell"><span class="qbadge '+(approved?"ok":"no")+'">'+(approved?"Auto-Approved":"Needs Reviewer")+'</span></div>' +
+        '<div class="qcell qtime">'+new Date(r.timestamp).toLocaleString()+'</div>' +
+      "</div>";
+    }).join("") || '<div class="qempty">No cases filed yet — run one from New Case.</div>';
+    document.getElementById("queueTable").innerHTML = rowsHtml;
+    Array.prototype.forEach.call(document.querySelectorAll(".qrow"), function(row){
+      row.addEventListener("click", function(){ openCaseDetail(row.getAttribute("data-id")); });
+    });
+  }
+
+  function openCaseDetail(id){
+    var q = loadQueue();
+    var record = q.filter(function(r){ return r.id===id; })[0];
+    if(!record) return;
+    var rowsHtml = (record.rows||[]).map(function(r){
+      if(r.status === "human") return '<div class="check-row"><span>'+r.topic+'</span><span class="val">Requires review<span class="glyph no">!</span></span></div>';
+      if(r.status === "unknown") return '<div class="check-row"><span>'+r.topic+'</span><span class="val">No data<span class="glyph no">?</span></span></div>';
+      var ok = r.status === "pass";
+      var arrow = r.rule === "min" ? "≥" : "≤";
+      return '<div class="check-row"><span>'+r.topic+'</span><span class="val">'+r.value+" "+r.unit+" (need "+arrow+" "+r.threshold+")"+
+        '<span class="glyph '+(ok?"ok":"no")+'">'+(ok?"✓":"✕")+"</span></span></div>";
+    }).join("");
+    var approved = record.determination === "Eligible for Administrative Approval";
+    var workflowHtml = approved ?
+      ('<div class="check-row"><span>Status</span><span class="val">'+escapeHtml(record.status||"Permit Issued")+'</span></div>' +
+       '<div class="check-row"><span>Estimated fee</span><span class="val">$'+(record.fee!=null?record.fee.toFixed(2):"—")+'</span></div>' +
+       '<div class="check-row"><span>Inspection scheduled</span><span class="val">'+(record.inspectionDateISO?new Date(record.inspectionDateISO).toLocaleDateString():"—")+'</span></div>') :
+      ('<div class="check-row"><span>Status</span><span class="val">'+escapeHtml(record.status||"Escalated")+'</span></div>' +
+       '<div class="check-row"><span>Routed to</span><span class="val">'+escapeHtml(record.routing||"—")+'</span></div>' +
+       '<div class="check-row"><span>Priority</span><span class="val">'+escapeHtml(record.priority||"—")+'</span></div>' +
+       '<div class="check-row"><span>Response due</span><span class="val">'+(record.dueDateISO?new Date(record.dueDateISO).toLocaleDateString():"—")+'</span></div>');
+    document.getElementById("caseDetailBody").innerHTML =
+      '<div class="view-head"><h2>'+record.id+'</h2><p class="view-sub">'+escapeHtml(record.address||"—")+' · '+escapeHtml(record.project||"—")+' · '+new Date(record.timestamp).toLocaleString()+'</p></div>' +
+      '<div class="doc-card"><h3>Compliance Check <span class="stamp-tag">On file</span></h3>'+rowsHtml+
+      '<div class="check-row" style="border-top:2px solid var(--line-strong);margin-top:6px;"><span><b>Determination</b></span><span class="val" style="font-weight:700;color:'+(approved?"var(--mint)":"var(--garnet)")+'">'+record.determination+'</span></div></div>' +
+      '<div class="doc-card" style="margin-top:16px;"><h3>Execution Workflow <span class="stamp-tag">On file</span></h3>'+workflowHtml+'</div>' +
+      '<div class="letter" style="margin-top:16px;"><div class="letterhead"><span>Office of Planning &amp; Permitting</span><span>'+new Date(record.timestamp).toLocaleDateString()+'</span></div>' +
+      '<div class="body-text">'+escapeHtml(record.letter||"")+'</div></div>' +
+      '<div class="exec-actions" style="max-width:820px;margin:16px auto 0;">' +
+        '<button class="ghost-btn" id="caseDlLetter">Download Determination Letter (.txt)</button>' +
+        (approved ?
+          '<button class="ghost-btn" id="caseDlExtra">Download Permit Record (.txt)</button><button class="ghost-btn" id="caseDlIcs">Download Inspection (.ics)</button>' :
+          '<button class="ghost-btn" id="caseDlExtra">Download Routing Packet (.txt)</button><button class="ghost-btn" id="caseDlIcs">Download Deadline (.ics)</button>') +
+      "</div>";
+    var dlLetter = document.getElementById("caseDlLetter");
+    if(dlLetter) dlLetter.addEventListener("click", function(){ downloadFile(record.id + "-determination-letter.txt", record.letter || "", "text/plain"); });
+    var dlExtra = document.getElementById("caseDlExtra");
+    if(dlExtra) dlExtra.addEventListener("click", function(){
+      if(approved) downloadFile(record.id + "-permit-record.txt", record.permitRecordText || "", "text/plain");
+      else downloadFile(record.id + "-routing-packet.txt", record.routingPacketText || "", "text/plain");
+    });
+    var dlIcs = document.getElementById("caseDlIcs");
+    if(dlIcs) dlIcs.addEventListener("click", function(){
+      if(approved) downloadFile(record.id + "-inspection.ics", record.inspectionIcs || "", "text/calendar");
+      else downloadFile(record.id + "-review-deadline.ics", record.reviewIcs || "", "text/calendar");
+    });
+    navigate("case");
+  }
+
+  // ---------------- router ----------------
+  var VIEWS = ["new","queue","case","how"];
+  function navigate(view){
+    if(VIEWS.indexOf(view) === -1) view = "new";
+    VIEWS.forEach(function(v){
+      var node = document.getElementById("view-"+v);
+      if(node) node.hidden = (v !== view);
+    });
+    Array.prototype.forEach.call(document.querySelectorAll(".navlink"), function(a){
+      a.classList.toggle("active", a.getAttribute("data-view") === view);
+    });
+    if(view === "queue") renderQueueView(STATE.queueFilter || "all");
+    window.scrollTo(0,0);
   }
 
   // ---------------- wiring ----------------
@@ -514,6 +894,31 @@
         document.getElementById("errBox").innerHTML = '<div class="err">Unexpected error: ' + escapeHtml(e.message||String(e)) + "</div>";
       }).finally(function(){ btn.disabled = false; });
     });
+
+    Array.prototype.forEach.call(document.querySelectorAll(".navlink"), function(a){
+      a.addEventListener("click", function(){ navigate(a.getAttribute("data-view")); });
+    });
+    var back = document.getElementById("backToQueue");
+    if(back) back.addEventListener("click", function(){ navigate("queue"); });
+
+    Array.prototype.forEach.call(document.querySelectorAll(".filter-btn"), function(btn){
+      btn.addEventListener("click", function(){
+        Array.prototype.forEach.call(document.querySelectorAll(".filter-btn"), function(b2){ b2.classList.remove("active"); });
+        btn.classList.add("active");
+        STATE.queueFilter = btn.getAttribute("data-filter");
+        renderQueueView(STATE.queueFilter);
+      });
+    });
+
+    var clearBtn = document.getElementById("clearQueueBtn");
+    if(clearBtn) clearBtn.addEventListener("click", function(){
+      clearQueue();
+      refreshSidebarStats();
+      renderQueueView(STATE.queueFilter || "all");
+    });
+
+    refreshSidebarStats();
+    navigate("new");
   }
 
   if(document.readyState === "loading") document.addEventListener("DOMContentLoaded", init);
