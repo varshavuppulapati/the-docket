@@ -1,7 +1,22 @@
 (function(){
   "use strict";
 
-  var STATE = { apiKey:null, currentExampleId:null, usedLive:false, usedDemo:false, warned:false, lastError:null,
+  // ============================================================================
+  // LIVE AI CONFIGURATION — set this once, here, before you deploy.
+  // Paste your own free Groq API key below (get one, no card required, at
+  // https://console.groq.com/keys) to turn on live AI calls for every visitor.
+  // Leave it blank ("") to run entirely in Demo Mode — the app works fully
+  // either way, it just uses local logic instead of a live model.
+  //
+  // Heads up: this is a static site with no backend, so whatever key you put
+  // here ships inside the public app.js file — anyone who opens dev tools on
+  // the deployed site can read it. That's fine for a free-tier demo key you
+  // don't mind others incidentally using, but don't paste a paid or
+  // production key here. You can regenerate/revoke a Groq key any time.
+  // ============================================================================
+  var GROQ_API_KEY = "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";
+
+  var STATE = { apiKey: (GROQ_API_KEY || "").trim() || null, currentExampleId:null, usedLive:false, usedDemo:false, warned:false, lastError:null,
     memQueue:null, memCounter:0 };
 
   var CURATED = {
@@ -696,15 +711,17 @@
   }
 
   function updateChipIdle(){
-    var chip = document.getElementById("statusChip"), txt = document.getElementById("statusTxt");
-    if(STATE.apiKey){ chip.className = "status-chip live"; txt.textContent = "Key set — live AI ready"; }
-    else { chip.className = "status-chip demo"; txt.textContent = "Demo mode"; }
+    var chip = document.getElementById("modeChip"), txt = document.getElementById("modeTxt");
+    if(!chip || !txt) return;
+    if(STATE.apiKey){ chip.className = "mode-pill live"; txt.textContent = "Live AI Ready"; }
+    else { chip.className = "mode-pill demo"; txt.textContent = "Demo Mode"; }
   }
   function updateChipAfterRun(){
-    var chip = document.getElementById("statusChip"), txt = document.getElementById("statusTxt");
-    if(STATE.usedLive && !STATE.usedDemo){ chip.className = "status-chip live"; txt.textContent = "Live AI agents"; }
-    else if(STATE.usedLive && STATE.usedDemo){ chip.className = "status-chip live"; txt.textContent = "Partially live — see badges"; }
-    else { chip.className = "status-chip demo"; txt.textContent = "Demo mode"; }
+    var chip = document.getElementById("modeChip"), txt = document.getElementById("modeTxt");
+    if(!chip || !txt) return;
+    if(STATE.usedLive && !STATE.usedDemo){ chip.className = "mode-pill live"; txt.textContent = "Ran Live"; }
+    else if(STATE.usedLive && STATE.usedDemo){ chip.className = "mode-pill live"; txt.textContent = "Partially Live"; }
+    else { chip.className = "mode-pill demo"; txt.textContent = "Demo Mode"; }
   }
 
   // ---------------- orchestration ----------------
@@ -861,6 +878,19 @@
   }
 
   // ---------------- wiring ----------------
+  function resetIntake(){
+    document.getElementById("errBox").innerHTML = "";
+    document.getElementById("docket").classList.remove("show");
+    document.getElementById("desk").innerHTML = "";
+    document.getElementById("impact").style.display = "none";
+    var textarea = document.getElementById("appText");
+    textarea.value = "";
+    STATE.currentExampleId = null;
+    var exContainer = document.getElementById("examples");
+    if(exContainer) Array.prototype.forEach.call(exContainer.children, function(el2){ el2.classList.remove("active"); });
+    textarea.focus();
+  }
+
   function init(){
     var exContainer = document.getElementById("examples");
     window.EXAMPLES.forEach(function(ex, idx){
@@ -879,11 +909,8 @@
     STATE.currentExampleId = window.EXAMPLES[0].id;
     document.getElementById("appText").addEventListener("input", function(){ STATE.currentExampleId = null; });
 
-    document.getElementById("saveKey").addEventListener("click", function(){
-      var v = document.getElementById("apiKey").value.trim();
-      STATE.apiKey = v || null;
-      updateChipIdle();
-    });
+    var newCaseBtn = document.getElementById("newCaseBtn");
+    if(newCaseBtn) newCaseBtn.addEventListener("click", resetIntake);
 
     document.getElementById("runBtn").addEventListener("click", function(){
       var text = document.getElementById("appText").value.trim();
@@ -896,7 +923,11 @@
     });
 
     Array.prototype.forEach.call(document.querySelectorAll(".navlink"), function(a){
-      a.addEventListener("click", function(){ navigate(a.getAttribute("data-view")); });
+      a.addEventListener("click", function(){
+        var view = a.getAttribute("data-view");
+        if(view === "new") resetIntake();
+        navigate(view);
+      });
     });
     var back = document.getElementById("backToQueue");
     if(back) back.addEventListener("click", function(){ navigate("queue"); });
@@ -918,6 +949,7 @@
     });
 
     refreshSidebarStats();
+    updateChipIdle();
     navigate("new");
   }
 

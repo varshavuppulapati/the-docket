@@ -20,7 +20,7 @@ Every live agent card also has a **"View agent detail"** toggle showing the mode
 
 The system only ever auto-approves when every applicable check passes. Anything that fails, is missing data, or falls under a category that always requires judgment (e.g. a historic overlay district) routes to a human reviewer by design.
 
-It's a static site — no backend, no build step, no database. It calls Groq's free API (GPT-OSS 120B) directly from the browser — a plain `fetch` to Groq's OpenAI-compatible endpoint, with your own API key held only in memory for that page load. If no key is entered, or a call fails, it falls back to an equivalent local "Demo Mode" so the page is never broken — a small badge always shows which mode each step actually ran in. The Case Queue persists in the browser's local storage (falls back to in-memory if storage is unavailable), so it survives a refresh but stays private to your browser.
+It's a static site — no backend, no build step, no database. It calls Groq's free API (GPT-OSS 120B) directly from the browser — a plain `fetch` to Groq's OpenAI-compatible endpoint. **There is no API key field in the UI.** The key is a constant the site owner sets once in `app.js` before deploying (see "Add your API key" below); visitors never see or enter anything. If the constant is left blank, or a call fails, the app falls back to an equivalent local "Demo Mode" so the page is never broken — a small pill in the sidebar always shows which mode the app is currently running in, and a badge on every agent card shows which mode that specific step actually ran in. The Case Queue persists in the browser's local storage (falls back to in-memory if storage is unavailable), so it survives a refresh but stays private to your browser.
 
 **Model note:** the app uses `openai/gpt-oss-120b`, which is on Groq's free tier and is a reasoning model — `app.js` sets `reasoning_effort: "low"` and gives extra token headroom so its internal reasoning doesn't crowd out the actual JSON answer. A couple of Groq's other models (e.g. `llama-3.3-70b-versatile`) are gated to Enterprise-tier accounts and will 404 with a plain free key — if you ever swap the model, check [console.groq.com/docs/models](https://console.groq.com/docs/models) first to confirm it's free-tier accessible.
 
@@ -50,7 +50,23 @@ Then open `http://localhost:8000`.
 4. Under **Build and deployment**, set **Source** to "Deploy from a branch," branch `main`, folder `/ (root)`.
 5. Save. GitHub gives you a live URL in about a minute: `https://<your-username>.github.io/<repo-name>/`.
 
-That URL is your working, demoable prototype. Paste a free Groq API key into the field at the top of the page (get one at [console.groq.com/keys](https://console.groq.com/keys) — no credit card required) to see all five agents run live.
+That URL is your working, demoable prototype, running in Demo Mode until you add a key (see below).
+
+## Add your API key (so visitors get live AI, not just Demo Mode)
+
+There's deliberately no key input box on the page — an earlier version had one, and it made the app look like it needed the *visitor* to sign up for something, which was confusing for a first-time user. Instead, you set your own key once, in the code:
+
+1. Get a free key at [console.groq.com/keys](https://console.groq.com/keys) (no credit card required).
+2. Open `app.js` and find the config block right at the top:
+   ```js
+   var GROQ_API_KEY = "";
+   ```
+3. Paste your key between the quotes: `var GROQ_API_KEY = "gsk_...";`
+4. Save, re-upload/push `app.js`, and the site redeploys automatically on GitHub Pages.
+
+The sidebar's mode pill will flip from "Demo Mode" to "Live AI Ready," and every case run afterward calls the real model.
+
+**Worth knowing:** because this is a static site with no server, that key ships inside the public `app.js` file — anyone who opens their browser's dev tools on your deployed page can read it. That's an acceptable trade-off for a free-tier demo key you don't mind others incidentally using, but never put a paid or production key here. Groq lets you regenerate or revoke a key at any time from the same console page.
 
 ## Notes for the demo
 
